@@ -31,7 +31,8 @@ private:
         juce::Label label;
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
     };
-    LabelledKnob zoomKnob, depthKnob, offsetKnob;
+    LabelledKnob zoomKnob, depthKnob, offsetKnob, syncKnob;
+    juce::TextButton syncButton { "SYNC TO KICK" };
 
     juce::Slider phaseFader { juce::Slider::LinearHorizontal, juce::Slider::TextBoxRight };
     juce::Label phaseLabel, windowLabel, rateLabel;
@@ -43,11 +44,10 @@ private:
     // Ducking: on / off and one LED button per curve (radio group on the choice parameter)
     juce::TextButton duckOnButton { "DUCK ON" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> duckOnAttachment;
-    juce::OwnedArray<juce::TextButton> shapeButtons;
-    std::unique_ptr<juce::ParameterAttachment> shapeAttachment;
+    juce::OwnedArray<CurveButton> shapeButtons;
     juce::RangedAudioParameter *offsetParameter = nullptr, *depthParameter = nullptr;
 
-    std::atomic<float> *zoom = nullptr, *duckOn = nullptr, *duckShape = nullptr, *duckDepth = nullptr, *duckOffset = nullptr;
+    std::atomic<float> *zoom = nullptr, *duckOn = nullptr, *duckDepth = nullptr, *duckOffset = nullptr;
 
     static constexpr int headerHeight = 48;
     juce::Rectangle<int> duckPanel, bottomPanel;

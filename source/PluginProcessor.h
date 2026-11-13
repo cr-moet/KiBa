@@ -15,10 +15,10 @@ namespace ParamIDs
     inline constexpr const char* zoom       = "zoom";         // dB, scope height
     inline constexpr const char* phase      = "phase";        // degrees, rotation of the bass
     inline constexpr const char* duckOn     = "duckOn";
-    inline constexpr const char* duckShape  = "duckShape";
     inline constexpr const char* duckDepth  = "duckDepth";    // %
     inline constexpr const char* duckRate   = "duckRate";     // period of the curve
     inline constexpr const char* duckOffset = "duckOffset";   // % of the period, shifts the curve in time
+    inline constexpr const char* sync       = "sync";         // ms, correction of the host position (scope and curve)
 }
 
 namespace Scope
@@ -34,7 +34,8 @@ namespace Scope
     };
 }
 
-class KiBaProcessor final : public juce::AudioProcessor
+class KiBaProcessor final : public juce::AudioProcessor,
+                            private juce::ValueTree::Listener
 {
 public:
     KiBaProcessor();
@@ -73,18 +74,54 @@ public:
     float getPlayPosition() const noexcept       { return playPosition.load(); }    // 0 ... 1 in the window
     bool hasSidechain() const noexcept           { return sidechainActive.load(); }
 
+    // Ducking curve (message thread): the points live in the state, the audio thread
+    // gets them as a table
+    Ducking::Curve getCurve() const;
+    int getPreset() const;                                      // -1: edited (custom)
+    void setCurve (const Ducking::Curve& curve, int preset);
+
+    // Start of the last kicks relative to the nearest beat (median, ms); empty without kicks
+    std::optional<float> getKickOnsetMs() const;
+
     juce::AudioProcessorValueTreeState apvts;
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     void storeColumn() noexcept;
+    juce::ValueTree curveTree();
+    void updateTable();
+    void detectKickOnset (float sample, double position) noexcept;
+
+    // Only changes of the curve (the parameters live in the same tree)
+    static bool isCurve (const juce::ValueTree& t)   { return t.hasType (Ducking::Curve::treeType) || t.hasType (Ducking::Curve::pointType); }
+    void valueTreePropertyChanged (juce::ValueTree& t, const juce::Identifier&) override        { if (isCurve (t)) updateTable(); }
+    void valueTreeChildAdded (juce::ValueTree& parent, juce::ValueTree& child) override          { if (isCurve (parent) || isCurve (child)) updateTable(); }
+    void valueTreeChildRemoved (juce::ValueTree& parent, juce::ValueTree& child, int) override   { if (isCurve (parent) || isCurve (child)) updateTable(); }
+    void valueTreeRedirected (juce::ValueTree&) override                                          { curveTree(); updateTable(); }
 
     PhaseRotator rotator;
     juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::None> kickDelay;   // same latency as the bass
     juce::AudioBuffer<float> kickMono;
 
-    std::atomic<float> *window = nullptr, *phase = nullptr, *duckOn = nullptr, *duckShape = nullptr,
-                       *duckDepth = nullptr, *duckRate = nullptr, *duckOffset = nullptr;
+    std::atomic<float> *window = nullptr, *phase = nullptr, *duckOn = nullptr,
+                       *duckDepth = nullptr, *duckRate = nullptr, *duckOffset = nullptr, *sync = nullptr;
+
+    // Curve table: written on the message thread, copied by the audio thread when it changed
+    juce::SpinLock tableLock;
+    Ducking::Table sharedTable, audioTable;
+    std::atomic<int> tableVersion { 0 };
+    int audioTableVersion = -1;
+    bool writingCurve = false;
+
+    // Kick onset detection (on the delayed kick, in the same time as the scope)
+    float fastEnvelope = 0.0f, slowEnvelope = 0.0f, kickPeak = 0.0f;
+    float fastRelease = 0.0f, slowCoefficient = 0.0f, peakRelease = 0.0f;
+    int holdOff = 0;
+    std::array<float, 512> envelopeHistory {};
+    std::array<double, 512> positionHistory {};
+    int historyPosition = 0;
+    std::array<std::atomic<float>, 8> onsets;
+    std::atomic<int> onsetCount { 0 };
 
     // Position of the host (quarter notes); while stopped it stands still
     double beat = 0.0, sampleRate = 48000.0;

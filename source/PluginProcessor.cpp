@@ -10,10 +10,114 @@ KiBaProcessor::KiBaProcessor()
     window     = apvts.getRawParameterValue (ParamIDs::window);
     phase      = apvts.getRawParameterValue (ParamIDs::phase);
     duckOn     = apvts.getRawParameterValue (ParamIDs::duckOn);
-    duckShape  = apvts.getRawParameterValue (ParamIDs::duckShape);
     duckDepth  = apvts.getRawParameterValue (ParamIDs::duckDepth);
     duckRate   = apvts.getRawParameterValue (ParamIDs::duckRate);
     duckOffset = apvts.getRawParameterValue (ParamIDs::duckOffset);
+    sync       = apvts.getRawParameterValue (ParamIDs::sync);
+
+    for (auto& o : onsets)
+        o.store (0.0f);
+    curveTree();   // the default curve (pump)
+    apvts.state.addListener (this);
+    updateTable();
+}
+
+//==============================================================================
+juce::ValueTree KiBaProcessor::curveTree()
+{
+    auto tree = apvts.state.getChildWithName (Ducking::Curve::treeType);
+    if (! tree.isValid())
+    {
+        tree = juce::ValueTree (Ducking::Curve::treeType, { { Ducking::Curve::presetId, 0 } });
+        Ducking::Curve::preset (0).writeTo (tree);
+        apvts.state.appendChild (tree, nullptr);
+    }
+    return tree;
+}
+
+Ducking::Curve KiBaProcessor::getCurve() const
+{
+    return Ducking::Curve::readFrom (apvts.state.getChildWithName (Ducking::Curve::treeType));
+}
+
+int KiBaProcessor::getPreset() const
+{
+    return (int) apvts.state.getChildWithName (Ducking::Curve::treeType).getProperty (Ducking::Curve::presetId, -1);
+}
+
+void KiBaProcessor::setCurve (const Ducking::Curve& curve, int preset)
+{
+    auto tree = curveTree();
+    {
+        const juce::ScopedValueSetter<bool> quiet (writingCurve, true);   // one table update, not one per point
+        tree.setProperty (Ducking::Curve::presetId, preset, nullptr);
+        curve.writeTo (tree);
+    }
+    updateTable();
+}
+
+void KiBaProcessor::updateTable()
+{
+    if (writingCurve)
+        return;
+    Ducking::Table table;
+    table.fill (getCurve());
+    {
+        const juce::SpinLock::ScopedLockType lock (tableLock);
+        sharedTable = table;
+    }
+    ++tableVersion;
+}
+
+std::optional<float> KiBaProcessor::getKickOnsetMs() const
+{
+    const int count = juce::jmin (onsetCount.load(), (int) onsets.size());
+    if (count == 0)
+        return {};
+    std::vector<float> values;
+    for (int i = 0; i < count; ++i)
+        values.push_back (onsets[(size_t) i].load());
+    std::sort (values.begin(), values.end());
+    return values[values.size() / 2];
+}
+
+// Kick onset: a fast envelope that jumps well above the slow one starts a kick; from there
+// back to where the envelope first rose (above 10 % of that value): the first transient.
+// The time of that sample relative to the nearest beat is kept (the last 8 kicks).
+void KiBaProcessor::detectKickOnset (float sample, double position) noexcept
+{
+    const float a = std::abs (sample);
+    fastEnvelope = juce::jmax (a, fastEnvelope * fastRelease);
+    slowEnvelope += (a - slowEnvelope) * slowCoefficient;
+    kickPeak = juce::jmax (a, kickPeak * peakRelease);
+
+    historyPosition = (historyPosition + 1) % (int) envelopeHistory.size();
+    envelopeHistory[(size_t) historyPosition] = fastEnvelope;
+    positionHistory[(size_t) historyPosition] = position;
+
+    if (holdOff > 0)
+    {
+        --holdOff;
+        return;
+    }
+    if (fastEnvelope < 4.0f * slowEnvelope + 1.0e-4f || fastEnvelope < 0.05f * kickPeak)
+        return;
+
+    const float threshold = 0.1f * fastEnvelope;
+    int start = historyPosition;
+    for (int back = 1; back < (int) envelopeHistory.size(); ++back)
+    {
+        const int i = (historyPosition - back + (int) envelopeHistory.size()) % (int) envelopeHistory.size();
+        if (envelopeHistory[(size_t) i] < threshold)
+            break;
+        start = i;
+    }
+    const double q = positionHistory[(size_t) start];
+    const float ms = (float) ((q - std::round (q)) * 60000.0 / juce::jmax (1.0, tempo.load()));
+    const int n = onsetCount.load();
+    onsets[(size_t) (n % (int) onsets.size())].store (ms);
+    onsetCount.store (n + 1);
+    holdOff = (int) (0.06 * sampleRate);   // one kick: no new onset within 60 ms
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout KiBaProcessor::createParameterLayout()
@@ -35,12 +139,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout KiBaProcessor::createParamet
                                                        AudioParameterFloatAttributes().withLabel ("deg").withStringFromValueFunction (
                                                            [] (float v, int) { return (v > 0.0f ? "+" : "") + String (roundToInt (v)) + String::fromUTF8 (" \xc2\xb0"); })));
     layout.add (std::make_unique<AudioParameterBool> (ParameterID { ParamIDs::duckOn, 1 }, "Duck On", true));
-    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ParamIDs::duckShape, 1 }, "Duck Shape", Ducking::shapeNames, 0));
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::duckDepth, 1 }, "Duck Depth",
                                                        NormalisableRange<float> (0.0f, 100.0f, 1.0f), 60.0f, withText ("%", 0, false)));
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ParamIDs::duckRate, 1 }, "Duck Rate", Ducking::rateNames, 2));
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::duckOffset, 1 }, "Duck Offset",
                                                        NormalisableRange<float> (-50.0f, 50.0f, 0.1f), 0.0f, withText ("%", 1, true)));
+    layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::sync, 1 }, "Sync",
+                                                       NormalisableRange<float> (-250.0f, 250.0f, 0.1f), 0.0f, withText ("ms", 1, true)));
     return layout;
 }
 
@@ -60,6 +165,13 @@ void KiBaProcessor::prepareToPlay (double newSampleRate, int samplesPerBlock)
     duckGain = 1.0f;
     duckSmoothing = 1.0f - std::exp (-1.0f / (0.0003f * (float) sampleRate));   // 0.3 ms: no click at the drop
     column = -1;
+
+    fastRelease = std::exp (-1.0f / (0.002f * (float) sampleRate));
+    slowCoefficient = 1.0f - std::exp (-1.0f / (0.05f * (float) sampleRate));
+    peakRelease = std::exp (-1.0f / (2.0f * (float) sampleRate));
+    fastEnvelope = slowEnvelope = kickPeak = 0.0f;
+    holdOff = 0;
+    onsetCount.store (0);
 }
 
 bool KiBaProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -134,16 +246,33 @@ void KiBaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
     barLength.store (barQuarters);
     tempo.store (bpm);
     const double perSample = bpm / 60.0 / sampleRate;
-    const double start = beat - getLatencySamples() * perSample;
+    // SYNC: hosts differ in how their position relates to the audio of a plugin with
+    // latency (and its sidechain); this correction puts the kick back onto the grid
+    const double start = beat - getLatencySamples() * perSample + sync->load() * 0.001 * bpm / 60.0;
 
     const int windowIndex = juce::jlimit (0, Scope::windowNames.size() - 1, juce::roundToInt (window->load()));
     const double length = Scope::windowNotes[windowIndex] * (windowIndex < 4 ? 4.0 : barQuarters);
     const int rateIndex = juce::jlimit (0, Ducking::rateNames.size() - 1, juce::roundToInt (duckRate->load()));
     const double period = rateIndex == 4 ? barQuarters : Ducking::rateBeats[rateIndex];
-    const auto shape = (Ducking::Shape) juce::jlimit (0, Ducking::shapeNames.size() - 1, juce::roundToInt (duckShape->load()));
+    if (const int version = tableVersion.load(); version != audioTableVersion)
+    {
+        const juce::SpinLock::ScopedTryLockType lock (tableLock);
+        if (lock.isLocked())
+        {
+            audioTable = sharedTable;
+            audioTableVersion = version;
+        }
+    }
     // Stopped: no ducking (back to unity within the smoothing) and the scope stands still
     const float depth = duckOn->load() > 0.5f && playing ? duckDepth->load() * 0.01f : 0.0f;
     const double offset = duckOffset->load() * 0.01;
+    if (! juce::approximatelyEqual (length, windowLength.load()))   // another window: start empty
+    {
+        for (auto& c : columns)
+            for (auto* v : { &c.bassMin, &c.bassMax, &c.kickMin, &c.kickMax })
+                v->store (0.0f, std::memory_order_relaxed);
+        column = -1;
+    }
     windowLength.store (length);
     duckPeriod.store (period);
 
@@ -152,7 +281,7 @@ void KiBaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
         const double t = start + i * perSample;
 
         // Ducking (smoothed by 0.3 ms against clicks at the steep edges)
-        const float target = Ducking::gain (shape, (float) (t / period - offset), depth);
+        const float target = 1.0f - depth * (1.0f - audioTable.at ((float) (t / period - offset)));
         duckGain += (target - duckGain) * duckSmoothing;
         float bass = 0.0f;
         for (int c = 0; c < numChannels; ++c)
@@ -164,6 +293,7 @@ void KiBaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
         bass /= (float) numChannels;
         if (! playing)
             continue;
+        detectKickOnset (kick[i], t);
 
         // Scope column
         const double position = t / length;

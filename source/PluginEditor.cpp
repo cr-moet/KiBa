@@ -7,7 +7,6 @@ KiBaEditor::KiBaEditor (KiBaProcessor& p)
     auto& apvts = processorRef.apvts;
     zoom       = apvts.getRawParameterValue (ParamIDs::zoom);
     duckOn     = apvts.getRawParameterValue (ParamIDs::duckOn);
-    duckShape  = apvts.getRawParameterValue (ParamIDs::duckShape);
     duckDepth  = apvts.getRawParameterValue (ParamIDs::duckDepth);
     duckOffset = apvts.getRawParameterValue (ParamIDs::duckOffset);
     offsetParameter = apvts.getParameter (ParamIDs::duckOffset);
@@ -15,7 +14,8 @@ KiBaEditor::KiBaEditor (KiBaProcessor& p)
 
     // Scope: drag the ducking curve (sideways: offset, up / down: depth)
     addAndMakeVisible (scope);
-    scope.setTooltip ("Drag sideways to shift the ducking curve, up / down for its depth; double click: no shift");
+    scope.setTooltip ("Drag a point to move it, the curve up / down to bend it, elsewhere: shift (sideways) and depth (up / down). "
+                      "Double click: add a point, on a point: remove it");
     scope.onDragStart = [this] { offsetParameter->beginChangeGesture(); depthParameter->beginChangeGesture(); };
     scope.onDragEnd   = [this] { offsetParameter->endChangeGesture();   depthParameter->endChangeGesture(); };
     scope.onDrag = [this] (float offsetChange, float depthChange)
@@ -30,12 +30,7 @@ KiBaEditor::KiBaEditor (KiBaProcessor& p)
         set (offsetParameter, offset);
         set (depthParameter, duckDepth->load() + depthChange);
     };
-    scope.onResetOffset = [this]
-    {
-        offsetParameter->beginChangeGesture();
-        offsetParameter->setValueNotifyingHost (offsetParameter->convertTo0to1 (0.0f));
-        offsetParameter->endChangeGesture();
-    };
+    scope.onCurveChange = [this] (const Ducking::Curve& curve) { processorRef.setCurve (curve, -1); };
 
     const auto setUpLabel = [this] (juce::Label& label, const juce::String& text)
     {
@@ -57,6 +52,24 @@ KiBaEditor::KiBaEditor (KiBaProcessor& p)
     setUpKnob (depthKnob, ParamIDs::duckDepth, "DEPTH");
     setUpKnob (offsetKnob, ParamIDs::duckOffset, "OFFSET");
     offsetKnob.knob.setDoubleClickReturnValue (true, 0.0);
+    setUpKnob (syncKnob, ParamIDs::sync, "SYNC");
+    syncKnob.knob.setDoubleClickReturnValue (true, 0.0);
+    syncKnob.knob.setTooltip ("Shifts scope and ducking curve against the host position; double click: 0");
+
+    // Measures where the kick starts and moves the scope so that it sits on the grid
+    syncButton.setTooltip ("Puts the kick onto the grid (play a kick on the beat first)");
+    syncButton.onClick = [this]
+    {
+        if (const auto ms = processorRef.getKickOnsetMs())
+        {
+            auto* parameter = processorRef.apvts.getParameter (ParamIDs::sync);
+            const float value = parameter->convertFrom0to1 (parameter->getValue()) - (float) *ms;
+            parameter->beginChangeGesture();
+            parameter->setValueNotifyingHost (parameter->convertTo0to1 (parameter->getNormalisableRange().snapToLegalValue (value)));
+            parameter->endChangeGesture();
+        }
+    };
+    addAndMakeVisible (syncButton);
 
     // Phase fader
     phaseFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 84, 26);
@@ -88,21 +101,12 @@ KiBaEditor::KiBaEditor (KiBaProcessor& p)
     duckOnAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (apvts, ParamIDs::duckOn, duckOnButton);
     addAndMakeVisible (duckOnButton);
 
-    auto* shapeParameter = apvts.getParameter (ParamIDs::duckShape);
-    for (int i = 0; i < Ducking::shapeNames.size(); ++i)
+    for (int i = 0; i < Ducking::presetNames.size(); ++i)
     {
-        auto* b = shapeButtons.add (new juce::TextButton (Ducking::shapeNames[i]));
-        b->getProperties().set ("led", true);
-        b->setClickingTogglesState (false);
-        b->onClick = [this, i] { shapeAttachment->setValueAsCompleteGesture ((float) i); };
+        auto* b = shapeButtons.add (new CurveButton (i));
+        b->onClick = [this, i] { processorRef.setCurve (Ducking::Curve::preset (i), i); };
         addAndMakeVisible (b);
     }
-    shapeAttachment = std::make_unique<juce::ParameterAttachment> (*shapeParameter, [this] (float value)
-    {
-        for (int i = 0; i < shapeButtons.size(); ++i)
-            shapeButtons[i]->setToggleState (i == juce::roundToInt (value), juce::dontSendNotification);
-    });
-    shapeAttachment->sendInitialUpdate();
 
     setOpaque (true);
     setResizable (true, true);
@@ -126,7 +130,8 @@ void KiBaEditor::timerCallback()
     s.barLength    = processorRef.getBarLength();
     s.period       = processorRef.getDuckPeriod();
     s.tempo        = processorRef.getTempo();
-    s.shape        = (Ducking::Shape) juce::jlimit (0, Ducking::shapeNames.size() - 1, juce::roundToInt (duckShape->load()));
+    s.curve        = processorRef.getCurve();
+    s.kickOnset    = processorRef.getKickOnsetMs();
     s.depth        = duckDepth->load() * 0.01f;
     s.offset       = duckOffset->load() * 0.01f;
     s.zoom         = juce::Decibels::decibelsToGain (zoom->load());
@@ -134,6 +139,11 @@ void KiBaEditor::timerCallback()
     s.duckOn       = duckOn->load() > 0.5f;
     s.sidechain    = processorRef.hasSidechain();
     scope.update (s);
+
+    // LED of the preset in use (none when the curve was edited)
+    const int preset = processorRef.getPreset();
+    for (int i = 0; i < shapeButtons.size(); ++i)
+        shapeButtons[i]->setToggleState (i == preset, juce::dontSendNotification);
 }
 
 void KiBaEditor::paint (juce::Graphics& g)
@@ -177,7 +187,7 @@ void KiBaEditor::resized()
     // Ducking curves: DUCK ON, then the curves
     auto d = duckPanel.reduced (30, 12);
     d.removeFromTop (22);
-    const int buttonHeight = juce::jmin (44, (d.getHeight() - 16) / (shapeButtons.size() + 1) - 6);
+    const int buttonHeight = juce::jmin (40, (d.getHeight() - 16 - 26 - 92) / (shapeButtons.size() + 2) - 6);
     duckOnButton.setBounds (d.removeFromTop (buttonHeight));
     d.removeFromTop (16);
     for (auto* b : shapeButtons)
@@ -185,6 +195,13 @@ void KiBaEditor::resized()
         b->setBounds (d.removeFromTop (buttonHeight));
         d.removeFromTop (6);
     }
+
+    // Timing at the bottom: SYNC knob and the button that measures it
+    auto timing = d.removeFromBottom (juce::jmin (d.getHeight(), 92 + 10 + buttonHeight));
+    syncButton.setBounds (timing.removeFromBottom (buttonHeight));
+    timing.removeFromBottom (10);
+    syncKnob.label.setBounds (timing.removeFromTop (14));
+    syncKnob.knob.setBounds (timing.withSizeKeepingCentre (juce::jmin (timing.getWidth(), 96), 78));
 
     // Bottom row, left to right: window, zoom | phase fader | depth, rate, offset
     auto r = bottomPanel.reduced (32, 6);
