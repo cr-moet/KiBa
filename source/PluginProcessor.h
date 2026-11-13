@@ -69,6 +69,7 @@ public:
     double getWindowLength() const noexcept      { return windowLength.load(); }    // quarter notes
     double getDuckPeriod() const noexcept        { return duckPeriod.load(); }      // quarter notes
     double getBarLength() const noexcept         { return barLength.load(); }       // quarter notes
+    double getTempo() const noexcept             { return tempo.load(); }           // bpm
     float getPlayPosition() const noexcept       { return playPosition.load(); }    // 0 ... 1 in the window
     bool hasSidechain() const noexcept           { return sidechainActive.load(); }
 
@@ -85,7 +86,7 @@ private:
     std::atomic<float> *window = nullptr, *phase = nullptr, *duckOn = nullptr, *duckShape = nullptr,
                        *duckDepth = nullptr, *duckRate = nullptr, *duckOffset = nullptr;
 
-    // Beat clock (quarter notes): from the host while playing, free running otherwise
+    // Position of the host (quarter notes); while stopped it stands still
     double beat = 0.0, sampleRate = 48000.0;
     float duckGain = 1.0f, duckSmoothing = 1.0f;
 
@@ -93,7 +94,7 @@ private:
     std::array<Scope::Column, Scope::numColumns> columns;
     int column = -1;
     float bassLow = 0.0f, bassHigh = 0.0f, kickLow = 0.0f, kickHigh = 0.0f;
-    std::atomic<double> windowStart { 0.0 }, windowLength { 1.0 }, duckPeriod { 1.0 }, barLength { 4.0 };
+    std::atomic<double> windowStart { 0.0 }, windowLength { 1.0 }, duckPeriod { 1.0 }, barLength { 4.0 }, tempo { 120.0 };
     std::atomic<float> playPosition { 0.0f };
     std::atomic<bool> sidechainActive { false };
 

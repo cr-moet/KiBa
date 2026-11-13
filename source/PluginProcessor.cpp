@@ -34,7 +34,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout KiBaProcessor::createParamet
                                                        NormalisableRange<float> (-180.0f, 180.0f, 1.0f), 0.0f,
                                                        AudioParameterFloatAttributes().withLabel ("deg").withStringFromValueFunction (
                                                            [] (float v, int) { return (v > 0.0f ? "+" : "") + String (roundToInt (v)) + String::fromUTF8 (" \xc2\xb0"); })));
-    layout.add (std::make_unique<AudioParameterBool> (ParameterID { ParamIDs::duckOn, 1 }, "Duck On", false));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { ParamIDs::duckOn, 1 }, "Duck On", true));
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ParamIDs::duckShape, 1 }, "Duck Shape", Ducking::shapeNames, 0));
     layout.add (std::make_unique<AudioParameterFloat> (ParameterID { ParamIDs::duckDepth, 1 }, "Duck Depth",
                                                        NormalisableRange<float> (0.0f, 100.0f, 1.0f), 60.0f, withText ("%", 0, false)));
@@ -118,17 +118,21 @@ void KiBaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
     // Tempo and position (quarter notes). The output is 'latency' late: what comes out now
     // belongs to the musical time 'latency' earlier, so the curve and the scope use that.
     double bpm = 120.0, barQuarters = 4.0;
+    bool playing = false;
     if (auto* head = getPlayHead())
         if (const auto position = head->getPosition())
         {
             bpm = position->getBpm().orFallback (120.0);
             if (const auto signature = position->getTimeSignature())
                 barQuarters = 4.0 * signature->numerator / juce::jmax (1, signature->denominator);
-            if (position->getIsPlaying())
-                if (const auto ppq = position->getPpqPosition())
-                    beat = *ppq;
+            if (const auto ppq = position->getPpqPosition(); ppq && position->getIsPlaying())
+            {
+                beat = *ppq;
+                playing = true;
+            }
         }
     barLength.store (barQuarters);
+    tempo.store (bpm);
     const double perSample = bpm / 60.0 / sampleRate;
     const double start = beat - getLatencySamples() * perSample;
 
@@ -137,7 +141,8 @@ void KiBaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
     const int rateIndex = juce::jlimit (0, Ducking::rateNames.size() - 1, juce::roundToInt (duckRate->load()));
     const double period = rateIndex == 4 ? barQuarters : Ducking::rateBeats[rateIndex];
     const auto shape = (Ducking::Shape) juce::jlimit (0, Ducking::shapeNames.size() - 1, juce::roundToInt (duckShape->load()));
-    const float depth = duckOn->load() > 0.5f ? duckDepth->load() * 0.01f : 0.0f;
+    // Stopped: no ducking (back to unity within the smoothing) and the scope stands still
+    const float depth = duckOn->load() > 0.5f && playing ? duckDepth->load() * 0.01f : 0.0f;
     const double offset = duckOffset->load() * 0.01;
     windowLength.store (length);
     duckPeriod.store (period);
@@ -157,6 +162,8 @@ void KiBaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
             bass += s;
         }
         bass /= (float) numChannels;
+        if (! playing)
+            continue;
 
         // Scope column
         const double position = t / length;
@@ -174,9 +181,11 @@ void KiBaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
         bassLow  = juce::jmin (bassLow, bass);   bassHigh = juce::jmax (bassHigh, bass);
         kickLow  = juce::jmin (kickLow, kick[i]); kickHigh = juce::jmax (kickHigh, kick[i]);
     }
-    storeColumn();
-    playPosition.store ((float) column / (float) Scope::numColumns);
-    beat += n * perSample;
+    if (playing)
+    {
+        storeColumn();
+        playPosition.store ((float) column / (float) Scope::numColumns);
+    }
 
     for (int c = numChannels; c < getTotalNumOutputChannels(); ++c)
         buffer.clear (c, 0, n);

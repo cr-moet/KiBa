@@ -125,6 +125,7 @@ void KiBaEditor::timerCallback()
     s.windowLength = processorRef.getWindowLength();
     s.barLength    = processorRef.getBarLength();
     s.period       = processorRef.getDuckPeriod();
+    s.tempo        = processorRef.getTempo();
     s.shape        = (Ducking::Shape) juce::jlimit (0, Ducking::shapeNames.size() - 1, juce::roundToInt (duckShape->load()));
     s.depth        = duckDepth->load() * 0.01f;
     s.offset       = duckOffset->load() * 0.01f;

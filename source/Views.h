@@ -55,6 +55,7 @@ public:
     struct Settings
     {
         double windowStart = 0.0, windowLength = 1.0, barLength = 4.0, period = 1.0;   // quarter notes
+        double tempo = 120.0;
         Ducking::Shape shape = Ducking::Shape::pump;
         float depth = 0.6f, offset = 0.0f, zoom = 1.0f, playPosition = 0.0f;
         bool duckOn = false, sidechain = true;
@@ -158,6 +159,33 @@ public:
         const float px = plot.getX() + settings.playPosition * plot.getWidth();
         g.setColour (Colours::text.withAlpha (0.5f));
         g.drawVerticalLine (juce::roundToInt (px), plot.getY(), plot.getBottom());
+
+        // Onsets of kick and bass relative to the nearest grid line (beat, or the window
+        // when it is shorter than a beat)
+        {
+            const auto onsetText = [&] (const char* name, auto amplitude)
+            {
+                int peak = 0;
+                float peakValue = 0.0f;
+                for (int c = 0; c < Scope::numColumns; ++c)
+                    if (const float a = amplitude (columns[(size_t) c]); a > peakValue) { peakValue = a; peak = c; }
+                if (peakValue < 1.0e-3f)
+                    return juce::String (name) + "  --";
+                int onset = peak;
+                while (onset > 0 && amplitude (columns[(size_t) onset - 1]) > 0.15f * peakValue)
+                    --onset;
+                const double step = juce::jmin (1.0, settings.windowLength);
+                const double q = settings.windowStart + (double) onset / Scope::numColumns * settings.windowLength;
+                const double ms = (q - std::round (q / step) * step) * 60000.0 / settings.tempo;
+                return juce::String (name) + "  " + (ms >= 0.0 ? "+" : "") + juce::String (ms, 1) + " ms";
+            };
+            const auto text = onsetText ("KICK", [&] (const Scope::Column& c) { return juce::jmax (std::abs (load (c.kickMin)), std::abs (load (c.kickMax))); })
+                            + "     "
+                            + onsetText ("BASS", [&] (const Scope::Column& c) { return juce::jmax (std::abs (load (c.bassMin)), std::abs (load (c.bassMax))); });
+            g.setColour (Colours::text.withAlpha (0.75f));
+            g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
+            g.drawText ("ONSET TO GRID:  " + text, plot.reduced (10.0f, 8.0f).removeFromTop (14.0f), juce::Justification::centredRight);
+        }
 
         if (! settings.sidechain)
         {
