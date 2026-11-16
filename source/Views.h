@@ -68,8 +68,27 @@ public:
 
     explicit ScopeView (const KiBaProcessor& p) : processor (p)   { setOpaque (true); }
 
-    void update (const Settings& s)
+    // Repaints only when the picture changes (new audio data or other settings)
+    void update (const Settings& s, int dataVersion)
     {
+        const auto same = [] (const Settings& a, const Settings& b)
+        {
+            if (a.curve.points.size() != b.curve.points.size())
+                return false;
+            for (size_t i = 0; i < a.curve.points.size(); ++i)
+                if (! juce::exactlyEqual (a.curve.points[i].x, b.curve.points[i].x) || ! juce::exactlyEqual (a.curve.points[i].y, b.curve.points[i].y)
+                    || ! juce::exactlyEqual (a.curve.points[i].bend, b.curve.points[i].bend))
+                    return false;
+            return juce::exactlyEqual (a.windowStart, b.windowStart) && juce::exactlyEqual (a.windowLength, b.windowLength)
+                && juce::exactlyEqual (a.barLength, b.barLength) && juce::exactlyEqual (a.period, b.period)
+                && juce::exactlyEqual (a.depth, b.depth) && juce::exactlyEqual (a.offset, b.offset) && juce::exactlyEqual (a.zoom, b.zoom)
+                && juce::exactlyEqual (a.playPosition, b.playPosition) && a.duckOn == b.duckOn && a.sidechain == b.sidechain
+                && a.kickOnset == b.kickOnset;
+        };
+        if (dataVersion == lastDataVersion && same (s, settings))
+            return;
+        lastDataVersion = dataVersion;
+
         const bool gridChanged = ! juce::approximatelyEqual (s.windowLength, settings.windowLength)
                               || ! juce::approximatelyEqual (s.barLength, settings.barLength);
         settings = s;
@@ -181,19 +200,33 @@ public:
         // Kick and bass: one shape each (upper edge forwards, lower edge back)
         const auto& columns = processor.getColumns();
         const float mid = plot.getCentreY(), scale = plot.getHeight() * 0.45f * settings.zoom;
-        const float columnWidth = plot.getWidth() / (float) Scope::numColumns;
+        // One point every 2 pixels at most (min / max over the columns it covers)
+        const int numPoints = juce::jlimit (16, Scope::numColumns, juce::roundToInt (plot.getWidth() / 2.0f));
+        const float pointWidth = plot.getWidth() / (float) numPoints;
         const float limit = plot.getHeight() * 0.55f;   // clipped just outside the display
         const auto waveY = [&] (float v) { return mid - juce::jlimit (-limit, limit, v * scale); };
+        std::vector<float> lows ((size_t) numPoints), highs ((size_t) numPoints);
         const auto envelope = [&] (auto low, auto high)
         {
-            juce::Path p;
-            for (int c = 0; c < Scope::numColumns; ++c)
+            for (int i = 0; i < numPoints; ++i)
             {
-                const float x = plot.getX() + ((float) c + 0.5f) * columnWidth;
-                if (c == 0) p.startNewSubPath (x, waveY (high (columns[(size_t) c]))); else p.lineTo (x, waveY (high (columns[(size_t) c])));
+                const int first = i * Scope::numColumns / numPoints, last = juce::jmax (first + 1, (i + 1) * Scope::numColumns / numPoints);
+                float lo = low (columns[(size_t) first]), hi = high (columns[(size_t) first]);
+                for (int c = first + 1; c < last; ++c)
+                {
+                    lo = juce::jmin (lo, low (columns[(size_t) c]));
+                    hi = juce::jmax (hi, high (columns[(size_t) c]));
+                }
+                lows[(size_t) i] = waveY (lo);
+                highs[(size_t) i] = waveY (hi);
             }
-            for (int c = Scope::numColumns; --c >= 0;)
-                p.lineTo (plot.getX() + ((float) c + 0.5f) * columnWidth, waveY (low (columns[(size_t) c])));
+            juce::Path p;
+            p.preallocateSpace (numPoints * 6 + 8);
+            p.startNewSubPath (plot.getX() + 0.5f * pointWidth, highs[0]);
+            for (int i = 1; i < numPoints; ++i)
+                p.lineTo (plot.getX() + ((float) i + 0.5f) * pointWidth, highs[(size_t) i]);
+            for (int i = numPoints; --i >= 0;)
+                p.lineTo (plot.getX() + ((float) i + 0.5f) * pointWidth, lows[(size_t) i]);
             p.closeSubPath();
             return p;
         };
@@ -202,14 +235,11 @@ public:
         const auto bass = envelope ([&] (const Scope::Column& c) { return load (c.bassMin); }, [&] (const Scope::Column& c) { return load (c.bassMax); });
 
         // Bass below, the kick on top (it is the reference to align to)
-        g.setColour (Colours::accent.withAlpha (0.45f));
+        // Filled only: stroking the long outlines would cost more than everything else
+        g.setColour (Colours::accent.withAlpha (0.8f));
         g.fillPath (bass);
-        g.setColour (Colours::accent);
-        g.strokePath (bass, juce::PathStrokeType (1.0f));
-        g.setColour (Colours::text.withAlpha (0.4f));
+        g.setColour (Colours::text.withAlpha (0.75f));
         g.fillPath (kick);
-        g.setColour (Colours::text.withAlpha (0.9f));
-        g.strokePath (kick, juce::PathStrokeType (1.2f));
 
         // Ducking curve (faint while ducking is off)
         juce::Path curve;
@@ -474,6 +504,7 @@ private:
     CachedLayer layer;
     std::optional<juce::Point<int>> lastDrag;
     Mode mode = Mode::none;
+    int lastDataVersion = -1;
     Ducking::Curve working;
     juce::Point<float> dragStart;
     float dragStartX = 0.0f;

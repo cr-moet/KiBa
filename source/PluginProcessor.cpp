@@ -157,9 +157,7 @@ void KiBaProcessor::prepareToPlay (double newSampleRate, int samplesPerBlock)
     rotator.setAngleDegrees (phase->load());
     setLatencySamples (rotator.getLatency());
 
-    kickDelay.prepare ({ sampleRate, (juce::uint32) samplesPerBlock, 1 });
-    kickDelay.setMaximumDelayInSamples (rotator.getLatency() + 1);
-    kickDelay.setDelay ((float) rotator.getLatency());
+    kickDelay.prepare (rotator.getLatency(), 1);
     kickMono.setSize (1, samplesPerBlock, false, false, true);
 
     duckGain = 1.0f;
@@ -218,10 +216,7 @@ void KiBaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
     }
     else
         juce::FloatVectorOperations::clear (kick, n);
-    {
-        juce::dsp::AudioBlock<float> block (kickMono.getArrayOfWritePointers(), 1, (size_t) n);
-        kickDelay.process (juce::dsp::ProcessContextReplacing<float> (block));
-    }
+    kickDelay.process (kickMono.getArrayOfWritePointers(), 1, n);
 
     // Bass: phase rotation
     rotator.setAngleDegrees (phase->load());
@@ -313,6 +308,7 @@ void KiBaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBu
     }
     if (playing)
     {
+        ++dataVersion;
         storeColumn();
         playPosition.store ((float) column / (float) Scope::numColumns);
     }

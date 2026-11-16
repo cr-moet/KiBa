@@ -73,6 +73,7 @@ public:
     double getTempo() const noexcept             { return tempo.load(); }           // bpm
     float getPlayPosition() const noexcept       { return playPosition.load(); }    // 0 ... 1 in the window
     bool hasSidechain() const noexcept           { return sidechainActive.load(); }
+    int getDataVersion() const noexcept          { return dataVersion.load(); }       // counts the blocks with new scope data
 
     // Ducking curve (message thread): the points live in the state, the audio thread
     // gets them as a table
@@ -100,7 +101,7 @@ private:
     void valueTreeRedirected (juce::ValueTree&) override                                          { curveTree(); updateTable(); }
 
     PhaseRotator rotator;
-    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::None> kickDelay;   // same latency as the bass
+    SimpleDelay kickDelay;   // same latency as the bass
     juce::AudioBuffer<float> kickMono;
 
     std::atomic<float> *window = nullptr, *phase = nullptr, *duckOn = nullptr,
@@ -134,6 +135,7 @@ private:
     std::atomic<double> windowStart { 0.0 }, windowLength { 1.0 }, duckPeriod { 1.0 }, barLength { 4.0 }, tempo { 120.0 };
     std::atomic<float> playPosition { 0.0f };
     std::atomic<bool> sidechainActive { false };
+    std::atomic<int> dataVersion { 0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (KiBaProcessor)
 };

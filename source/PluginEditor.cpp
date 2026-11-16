@@ -138,7 +138,7 @@ void KiBaEditor::timerCallback()
     s.playPosition = processorRef.getPlayPosition();
     s.duckOn       = duckOn->load() > 0.5f;
     s.sidechain    = processorRef.hasSidechain();
-    scope.update (s);
+    scope.update (s, processorRef.getDataVersion());
 
     // LED of the preset in use (none when the curve was edited)
     const int preset = processorRef.getPreset();

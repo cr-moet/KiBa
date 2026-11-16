@@ -3,108 +3,148 @@
 #include <juce_dsp/juce_dsp.h>
 
 //==============================================================================
-// Uniformly partitioned convolution (overlap-save), fixed latency of one partition.
-// The impulse response is set synchronously in prepare(), so the very first block is
-// already right (also when the host renders faster than real time).
+// Uniformly partitioned convolution (overlap-save) of up to two channels with the same
+// real impulse response, fixed latency of one partition. Both channels go through one
+// complex FFT (left + i * right): the response is real, so the result is
+//      left * h + i * (right * h)
+// and one forward and one inverse FFT per block serve both channels.
+// The response is set synchronously in prepare(), so the very first block is already
+// right (also when the host renders faster than real time).
 //==============================================================================
 class PartitionedConvolver
 {
 public:
     static constexpr int blockSize = 256, fftSize = 2 * blockSize;
 
-    void prepare (const float* ir, int length, int numChannels)
+    void prepare (const float* ir, int length)
     {
         numPartitions = (length + blockSize - 1) / blockSize;
         spectra.assign ((size_t) numPartitions * fftSize * 2, 0.0f);
-        std::vector<float> work ((size_t) fftSize * 2);
+        std::vector<Complex> time ((size_t) fftSize), frequency ((size_t) fftSize);
         for (int p = 0; p < numPartitions; ++p)
         {
-            std::fill (work.begin(), work.end(), 0.0f);
+            std::fill (time.begin(), time.end(), Complex());
             for (int i = 0; i < blockSize && p * blockSize + i < length; ++i)
-                work[(size_t) i] = ir[p * blockSize + i];
-            fft.performRealOnlyForwardTransform (work.data(), true);
-            std::copy (work.begin(), work.begin() + fftSize + 2, spectra.begin() + (size_t) p * fftSize * 2);
+                time[(size_t) i] = ir[p * blockSize + i];
+            fft.perform (time.data(), frequency.data(), false);
+            std::memcpy (spectra.data() + (size_t) p * fftSize * 2, frequency.data(), sizeof (Complex) * fftSize);
         }
-        channels.resize ((size_t) numChannels);
-        for (auto& c : channels)
-        {
-            c.input.assign ((size_t) fftSize, 0.0f);
-            c.output.assign ((size_t) blockSize, 0.0f);
-            c.history.assign ((size_t) numPartitions * fftSize * 2, 0.0f);
-            c.newest = 0;
-        }
+        history.assign ((size_t) numPartitions * fftSize * 2, 0.0f);
+        input.assign ((size_t) fftSize, Complex());
+        output.assign ((size_t) blockSize, Complex());
+        work.assign ((size_t) fftSize, Complex());
+        accumulator.assign ((size_t) fftSize * 2, 0.0f);
+        newest = 0;
         fill = 0;
     }
 
     void reset()
     {
-        for (auto& c : channels)
-        {
-            std::fill (c.input.begin(), c.input.end(), 0.0f);
-            std::fill (c.output.begin(), c.output.end(), 0.0f);
-            std::fill (c.history.begin(), c.history.end(), 0.0f);
-        }
+        std::fill (history.begin(), history.end(), 0.0f);
+        std::fill (input.begin(), input.end(), Complex());
+        std::fill (output.begin(), output.end(), Complex());
         fill = 0;
     }
 
-    // In place; the output is 'blockSize' samples late
-    void process (float* const* data, int numChannels, int numSamples)
+    // In place on one or two channels; the output is 'blockSize' samples late
+    void process (float* left, float* right, int numSamples)
     {
         for (int i = 0; i < numSamples;)
         {
             const int count = juce::jmin (numSamples - i, blockSize - fill);
-            for (int ch = 0; ch < numChannels; ++ch)
+            for (int k = 0; k < count; ++k)
             {
-                auto& c = channels[(size_t) ch];
-                std::copy_n (data[ch] + i, count, c.input.data() + blockSize + fill);
-                std::copy_n (c.output.data() + fill, count, data[ch] + i);
+                const auto j = (size_t) (fill + k);
+                input[(size_t) blockSize + j] = { left[i + k], right != nullptr ? right[i + k] : 0.0f };
+                left[i + k] = output[j].real();
+                if (right != nullptr)
+                    right[i + k] = output[j].imag();
             }
             fill += count;
             i += count;
             if (fill == blockSize)
             {
-                for (int ch = 0; ch < numChannels; ++ch)
-                    runBlock (channels[(size_t) ch]);
+                runBlock();
                 fill = 0;
             }
         }
     }
 
 private:
-    struct Channel
-    {
-        std::vector<float> input, output, history;   // history: the input spectra, newest at 'newest'
-        int newest = 0;
-    };
+    using Complex = std::complex<float>;
 
-    void runBlock (Channel& c)
+    void runBlock()
     {
-        // Spectrum of the last two blocks into the history
-        c.newest = (c.newest + numPartitions - 1) % numPartitions;
-        float* spectrum = c.history.data() + (size_t) c.newest * fftSize * 2;
-        std::fill (spectrum, spectrum + fftSize * 2, 0.0f);
-        std::copy (c.input.begin(), c.input.end(), spectrum);
-        fft.performRealOnlyForwardTransform (spectrum, true);
-        std::copy (c.input.begin() + blockSize, c.input.end(), c.input.begin());   // keep the newer half
+        // Spectrum of the last two blocks into the history (newest first)
+        newest = (newest + numPartitions - 1) % numPartitions;
+        fft.perform (input.data(), reinterpret_cast<Complex*> (history.data() + (size_t) newest * fftSize * 2), false);
+        std::copy (input.begin() + blockSize, input.end(), input.begin());   // keep the newer half
 
         // Sum over the partitions: input spectrum k blocks ago times partition k
-        accumulator.assign ((size_t) fftSize * 2, 0.0f);
-        auto* acc = reinterpret_cast<std::complex<float>*> (accumulator.data());
+        // (plain float arrays, so the compiler can vectorise the loop)
+        std::fill (accumulator.begin(), accumulator.end(), 0.0f);
+        float* acc = accumulator.data();
         for (int k = 0; k < numPartitions; ++k)
         {
-            const auto* x = reinterpret_cast<const std::complex<float>*> (c.history.data() + (size_t) ((c.newest + k) % numPartitions) * fftSize * 2);
-            const auto* h = reinterpret_cast<const std::complex<float>*> (spectra.data() + (size_t) k * fftSize * 2);
-            for (int b = 0; b <= blockSize; ++b)
-                acc[b] += x[b] * h[b];
+            const float* x = history.data() + (size_t) ((newest + k) % numPartitions) * fftSize * 2;
+            const float* h = spectra.data() + (size_t) k * fftSize * 2;
+            for (int b = 0; b < 2 * fftSize; b += 2)
+            {
+                acc[b]     += x[b] * h[b]     - x[b + 1] * h[b + 1];
+                acc[b + 1] += x[b] * h[b + 1] + x[b + 1] * h[b];
+            }
         }
-        fft.performRealOnlyInverseTransform (accumulator.data());
-        std::copy_n (accumulator.data() + blockSize, blockSize, c.output.data());   // overlap-save: the second half is valid
+        fft.perform (reinterpret_cast<const Complex*> (accumulator.data()), work.data(), true);
+        std::copy_n (work.begin() + blockSize, blockSize, output.begin());   // overlap-save: the second half is valid
     }
 
     juce::dsp::FFT fft { 9 };   // 512 = fftSize
-    int numPartitions = 0, fill = 0;
-    std::vector<float> spectra, accumulator;
-    std::vector<Channel> channels;
+    int numPartitions = 0, fill = 0, newest = 0;
+    std::vector<float> spectra, history, accumulator;   // interleaved complex
+    std::vector<Complex> input, output, work;
+};
+
+//==============================================================================
+// Whole-sample delay for one or two channels
+//==============================================================================
+class SimpleDelay
+{
+public:
+    void prepare (int delaySamples, int numChannels)
+    {
+        length = delaySamples + 1;
+        buffers.assign ((size_t) numChannels, std::vector<float> ((size_t) length, 0.0f));
+        position = 0;
+    }
+
+    void reset()
+    {
+        for (auto& b : buffers)
+            std::fill (b.begin(), b.end(), 0.0f);
+    }
+
+    void process (float* const* data, int numChannels, int numSamples) noexcept
+    {
+        const int start = position;
+        for (int c = 0; c < numChannels; ++c)
+        {
+            auto* ring = buffers[(size_t) c].data();
+            int p = start;
+            for (int i = 0; i < numSamples; ++i)
+            {
+                const float x = data[c][i];
+                const int read = p + 1 == length ? 0 : p + 1;   // the oldest sample: 'length - 1' ago
+                ring[p] = x;
+                data[c][i] = ring[read];
+                p = read;
+            }
+            position = p;
+        }
+    }
+
+private:
+    std::vector<std::vector<float>> buffers;
+    int length = 1, position = 0;
 };
 
 //==============================================================================
@@ -143,11 +183,8 @@ public:
             const double window = bessel0 (beta * std::sqrt (juce::jmax (0.0, 1.0 - r * r))) / i0Beta;
             h[(size_t) n] = (m % 2 != 0) ? (float) (2.0 / (juce::MathConstants<double>::pi * m) * window) : 0.0f;
         }
-        hilbert.prepare (h.data(), taps, (int) spec.numChannels);
-
-        delay.prepare (spec);
-        delay.setMaximumDelayInSamples (latency + 1);
-        delay.setDelay ((float) latency);
+        hilbert.prepare (h.data(), taps);
+        delay.prepare (latency, (int) spec.numChannels);
 
         quadrature.setSize ((int) spec.numChannels, (int) spec.maximumBlockSize, false, false, true);
         cosine.reset (spec.sampleRate, 0.03);
@@ -177,9 +214,8 @@ public:
         for (int c = 0; c < numChannels; ++c)
             quadrature.copyFrom (c, 0, buffer, c, 0, n);
 
-        juce::dsp::AudioBlock<float> direct (buffer.getArrayOfWritePointers(), (size_t) numChannels, (size_t) n);
-        delay.process (juce::dsp::ProcessContextReplacing<float> (direct));
-        hilbert.process (quadrature.getArrayOfWritePointers(), numChannels, n);
+        delay.process (buffer.getArrayOfWritePointers(), numChannels, n);
+        hilbert.process (quadrature.getWritePointer (0), numChannels > 1 ? quadrature.getWritePointer (1) : nullptr, n);
 
         if (! cosine.isSmoothing() && ! sine.isSmoothing())
         {
@@ -212,7 +248,7 @@ private:
     }
 
     PartitionedConvolver hilbert;
-    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::None> delay;
+    SimpleDelay delay;
     juce::AudioBuffer<float> quadrature;
     juce::SmoothedValue<float> cosine { 1.0f }, sine { 0.0f };
     float angle = 0.0f;
