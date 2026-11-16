@@ -92,8 +92,8 @@ public:
     {
         const auto pos = e.position;
         setMouseCursor (hitPoint (pos) >= 0 ? juce::MouseCursor::DraggingHandCursor
-                        : hitSegment (pos) >= 0 ? juce::MouseCursor::UpDownResizeCursor
-                                                : juce::MouseCursor::NormalCursor);
+                        : hitBendHandle (pos) >= 0 || hitSegment (pos) >= 0 ? juce::MouseCursor::UpDownResizeCursor
+                                                                            : juce::MouseCursor::NormalCursor);
     }
 
     void mouseDown (const juce::MouseEvent& e) override
@@ -106,7 +106,7 @@ public:
             mode = Mode::point;
             dragStartX = working.points[(size_t) dragIndex].x;
         }
-        else if ((dragIndex = hitSegment (e.position)) >= 0)
+        else if ((dragIndex = hitBendHandle (e.position)) >= 0 || (dragIndex = hitSegment (e.position)) >= 0)
         {
             mode = Mode::bend;
             dragStartX = working.points[(size_t) dragIndex].bend;
@@ -183,17 +183,17 @@ public:
         const float mid = plot.getCentreY(), scale = plot.getHeight() * 0.45f * settings.zoom;
         const float columnWidth = plot.getWidth() / (float) Scope::numColumns;
         const float limit = plot.getHeight() * 0.55f;   // clipped just outside the display
-        const auto yOf = [&] (float v) { return mid - juce::jlimit (-limit, limit, v * scale); };
+        const auto waveY = [&] (float v) { return mid - juce::jlimit (-limit, limit, v * scale); };
         const auto envelope = [&] (auto low, auto high)
         {
             juce::Path p;
             for (int c = 0; c < Scope::numColumns; ++c)
             {
                 const float x = plot.getX() + ((float) c + 0.5f) * columnWidth;
-                if (c == 0) p.startNewSubPath (x, yOf (high (columns[(size_t) c]))); else p.lineTo (x, yOf (high (columns[(size_t) c])));
+                if (c == 0) p.startNewSubPath (x, waveY (high (columns[(size_t) c]))); else p.lineTo (x, waveY (high (columns[(size_t) c])));
             }
             for (int c = Scope::numColumns; --c >= 0;)
-                p.lineTo (plot.getX() + ((float) c + 0.5f) * columnWidth, yOf (low (columns[(size_t) c])));
+                p.lineTo (plot.getX() + ((float) c + 0.5f) * columnWidth, waveY (low (columns[(size_t) c])));
             p.closeSubPath();
             return p;
         };
@@ -225,7 +225,24 @@ public:
         g.setColour (Colours::orange.withAlpha (settings.duckOn ? 1.0f : 0.4f));
         g.strokePath (curve, juce::PathStrokeType (2.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 
-        // The points (when a period is wide enough to edit)
+        // The points and, in the middle of each segment, the bend handles (when a period is
+        // wide enough to edit)
+        if (periodWidth() >= 40.0f)
+        {
+            const auto& points = settings.curve.points;
+            for (size_t i = 0; i + 1 < points.size(); ++i)
+            {
+                if (std::abs (points[i + 1].y - points[i].y) < 0.01f)
+                    continue;   // a flat segment cannot bend
+                const float phase = segmentMiddle (i);
+                const float y = yOf (settings.curve.evaluate (phase));
+                forEachRepetition (phase, [&] (float x)
+                {
+                    g.setColour (Colours::orange.withAlpha (settings.duckOn ? 0.9f : 0.45f));
+                    g.fillRect (juce::Rectangle<float> (6.0f, 6.0f).withCentre ({ x, y }));
+                });
+            }
+        }
         if (periodWidth() >= 40.0f)
             for (const auto& p : settings.curve.points)
                 forEachRepetition (p.x, [&] (float x)
@@ -346,6 +363,37 @@ private:
             });
         }
         return periodWidth() >= 40.0f ? best : -1;
+    }
+
+    float segmentMiddle (size_t i) const
+    {
+        return 0.5f * (settings.curve.points[i].x + settings.curve.points[i + 1].x);
+    }
+
+    // The square in the middle of a segment: drag up / down to bend it
+    int hitBendHandle (juce::Point<float> pos) const
+    {
+        if (periodWidth() < 40.0f)
+            return -1;
+        const auto& points = settings.curve.points;
+        int best = -1;
+        float bestDistance = 8.0f;
+        for (size_t i = 0; i + 1 < points.size(); ++i)
+        {
+            if (std::abs (points[i + 1].y - points[i].y) < 0.01f)
+                continue;
+            const float phase = segmentMiddle (i);
+            const float y = yOf (settings.curve.evaluate (phase));
+            forEachRepetition (phase, [&] (float x)
+            {
+                if (const float d = pos.getDistanceFrom ({ x, y }); d < bestDistance)
+                {
+                    bestDistance = d;
+                    best = (int) i;
+                }
+            });
+        }
+        return best;
     }
 
     int hitSegment (juce::Point<float> pos) const
